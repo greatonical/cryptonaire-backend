@@ -1,0 +1,1 @@
+Schemas map to DTOs.

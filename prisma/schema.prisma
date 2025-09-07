@@ -1,0 +1,143 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String   @id @default(cuid())
+  walletAddress   String   @unique
+  farcasterUserId String?  @unique
+  status          String   @default("active") // active | suspended | blocked
+  role            String   @default("user")   // user | admin
+  verified        Boolean  @default(false)
+  jwtVersion      Int      @default(1)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  profile    Profile?
+  sessions   QuizSession[]
+  attempts   Attempt[]
+  rewards    RewardAllocation[]
+  userBadges UserBadge[]
+}
+
+model Profile {
+  id          String  @id @default(cuid())
+  userId      String  @unique
+  username    String? @unique
+  avatarUrl   String?
+  country     String?
+  preferences Json?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Question {
+  id                String    @id @default(cuid())
+  category          String
+  difficulty        Int
+  avgTimeToAnswerMs Int
+  body              Json // { text, options: [A..D], correct_index }
+  source            String // 'ai' | 'human'
+  version           Int       @default(1)
+  active            Boolean   @default(true)
+  uniqueHash         String?  @unique
+  createdBy         String?
+  createdAt         DateTime  @default(now())
+  Attempt           Attempt[]
+
+  @@index([category, active])
+}
+
+model QuizSession {
+  id                         String    @id @default(cuid())
+  userId                     String
+  startedAt                  DateTime  @default(now())
+  endedAt                    DateTime?
+  totalSeconds               Int       @default(0)
+  stageUnlocked              Int       @default(1)
+  dailyQuotaSecondsRemaining Int       @default(3600) // 1 hour default
+  state                      String    @default("active") // active|completed|forfeited|timeout
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  attempts Attempt[]
+}
+
+model Attempt {
+  id            String    @id @default(cuid())
+  sessionId     String
+  questionId    String
+  attemptToken  String
+  startedAt     DateTime  @default(now())
+  answeredAt    DateTime?
+  timeTakenMs   Int?
+  selectedIndex Int?
+  correct       Boolean?
+  pointsDelta   Int       @default(0)
+  clientMeta    Json?
+
+  session  QuizSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question Question    @relation(fields: [questionId], references: [id], onDelete: Restrict)
+  User     User?       @relation(fields: [userId], references: [id])
+  userId   String?
+}
+
+model SiweNonce {
+  nonce         String   @id
+  walletAddress String
+  createdAt     DateTime @default(now())
+  used          Boolean  @default(false)
+}
+
+model RewardRound {
+  weekId       Int      @id
+  rewardToken  String // 'USDC' | 'ETH'
+  totalPoolWei String
+  merkleRoot   String?
+  status       String   @default("open") // open|finalized|distributed
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  allocations RewardAllocation[]
+}
+
+model RewardAllocation {
+  id            String    @id @default(cuid())
+  weekId        Int
+  userId        String
+  walletAddress String
+  amountWei     String
+  payoutState   String    @default("pending") // pending|claimed|sent|failed
+  txHash        String?
+  claimedAt     DateTime?
+
+  user  User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  round RewardRound @relation(fields: [weekId], references: [weekId], onDelete: Cascade)
+
+  @@unique([weekId, userId])
+  @@unique([weekId, walletAddress])
+}
+
+model Badge {
+  id        String      @id @default(cuid())
+  slug      String      @unique
+  criteria  Json?
+  UserBadge UserBadge[]
+}
+
+model UserBadge {
+  id        String   @id @default(cuid())
+  userId    String
+  badgeId   String
+  awardedAt DateTime @default(now())
+  onchainTx String?
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  badge Badge @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, badgeId])
+}
