@@ -12,7 +12,7 @@ async function fetchWithTimeout(url: string, init: any, ms = 25000) {
 export class GroqProvider implements AIProvider {
   constructor(
     private readonly apiKey: string,
-    private readonly model = process.env.GROQ_MODEL || 'llama-3.1-70b-versatile'
+    private readonly model = process.env.GROQ_MODEL || 'llama-3.1-8b-instant'
   ) {
     if (!apiKey) throw new Error('GROQ_API_KEY missing');
   }

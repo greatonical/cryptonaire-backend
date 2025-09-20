@@ -21,7 +21,8 @@ export class GameController {
     return this.game.getStatus(user.uid);
   }
 
-  @Post('question/next')
+  // MUST be GET to match the frontend client
+  @Get('question/next')
   async nextQuestion(@CurrentUser() user: any) {
     return this.game.nextQuestion(user.uid);
   }

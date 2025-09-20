@@ -14,7 +14,7 @@ export class LeaderboardController {
     return this.lb.getWeeklyTop({ cursor: q.cursor, limit: q.limit, weekId: q.weekId });
   }
 
-  @Get('all-time')
+  @Get('alltime')
   async allTime(@Query() q: GetLeaderboardDto) {
     return this.lb.getAllTimeTop({ cursor: q.cursor, limit: q.limit });
   }

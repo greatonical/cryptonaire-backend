@@ -11,6 +11,8 @@ import { AdminModule } from '@modules/admin/admin.module';
 import { PayoutsModule } from '@modules/payouts/payouts.module';
 import { PrismaService } from '@infra/prisma.service';
 import { ProfileModule } from './modules/profile/profile.module';
+import { RewardsModule } from './modules/rewards/rewards.module';
+import { QuestionsModule } from './modules/question/questions.module';
 
 @Module({
   imports: [
@@ -32,7 +34,9 @@ import { ProfileModule } from './modules/profile/profile.module';
     LeaderboardModule,
     AdminModule,
     PayoutsModule,
-    ProfileModule
+    ProfileModule,
+    RewardsModule,
+    QuestionsModule
   ],
   providers: [
     PrismaService,
