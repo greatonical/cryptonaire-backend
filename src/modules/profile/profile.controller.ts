@@ -18,4 +18,4 @@ export class ProfileController {
   update(@CurrentUser() user: any, @Body() dto: UpdateProfileDto) {
     return this.profile.updateMyProfile(user.uid, dto);
   }
-}
+} 

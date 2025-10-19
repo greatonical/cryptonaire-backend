@@ -50,7 +50,11 @@ model Question {
   createdAt         DateTime  @default(now())
   Attempt           Attempt[]
 
+  // NEW – for de-duping generated content
+  hash               String? @unique
+
   @@index([category, active])
+  @@index([category])
 }
 
 model QuizSession {

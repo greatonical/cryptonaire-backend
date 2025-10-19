@@ -42,6 +42,11 @@ export class GameController {
     return this.game.continueWithPenalty(user.uid, dto.reason);
   }
 
+   @Post('session/reset-points')
+  async resetPoints(@CurrentUser() user: any) {
+    return this.game.resetPointsToZero(user.uid);
+  }
+
   @Post('session/end')
   async endSession(@CurrentUser() user: any) {
     return this.game.endSession(user.uid);

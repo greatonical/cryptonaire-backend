@@ -7,6 +7,11 @@ import { createAIProvider } from '@infra/ai/ai.factory';
 import type { AIProviderName } from '@infra/ai/ai.types';
 import { canonicalizeQuestion, sha256 } from '@common/utils/hash.util';
 
+import crypto from "node:crypto";
+
+function qHash(text: string) {
+  return crypto.createHash("sha256").update(text.trim().toLowerCase()).digest("hex");
+}
 
 @Injectable()
 export class AdminService {
@@ -52,12 +57,42 @@ export class AdminService {
   }
 
   // ---------- Questions ----------
+  // async createQuestion(data: {
+  //   category: string; difficulty: number; avgTimeToAnswerMs: number;
+  //   body: any; source: 'human'|'ai'; active?: boolean;
+  // }) {
+  //   return this.prisma.question.create({ data: { ...data, active: data.active ?? true } });
+  // }
+
   async createQuestion(data: {
-    category: string; difficulty: number; avgTimeToAnswerMs: number;
-    body: any; source: 'human'|'ai'; active?: boolean;
-  }) {
-    return this.prisma.question.create({ data: { ...data, active: data.active ?? true } });
-  }
+  category: string;
+  difficulty: number;
+  avgTimeToAnswerMs: number;
+  body: any;
+  source: "human" | "ai";
+  active?: boolean;
+}) {
+  const text = String(data?.body?.text ?? "").trim();
+  if (!text) throw new Error("Question text required");
+  const hash = qHash(text);
+
+  return this.prisma.question.upsert({
+    where: { hash },
+    update: {
+      category: data.category,
+      difficulty: data.difficulty,
+      avgTimeToAnswerMs: data.avgTimeToAnswerMs,
+      body: data.body,
+      active: data.active ?? true,
+      source: data.source,
+    },
+    create: {
+      ...data,
+      active: data.active ?? true,
+      hash,
+    },
+  });
+}
 
   async updateQuestion(id: string, data: Partial<{ category: string; difficulty: number; avgTimeToAnswerMs: number; body: any; active: boolean; }>) {
     return this.prisma.question.update({ where: { id }, data });

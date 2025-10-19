@@ -9,6 +9,8 @@ import { GetLeaderboardDto } from '@modules/leaderboard/dto/get-leaderboard.dto'
 export class LeaderboardController {
   constructor(private readonly lb: LeaderboardService) {}
 
+  
+
   @Get('weekly')
   async weekly(@Query() q: GetLeaderboardDto) {
     return this.lb.getWeeklyTop({ cursor: q.cursor, limit: q.limit, weekId: q.weekId });

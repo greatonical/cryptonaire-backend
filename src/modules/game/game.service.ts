@@ -141,17 +141,8 @@ export class GameService {
     const remaining = await this.remainingQuota(userId, session);
     if (remaining <= 0) throw new ForbiddenException('Daily quota exceeded');
 
-    const stage = await this.decideCurrentStage(
-      session.id,
-      this.asStage(session.stageUnlocked),
-    );
-    if (!stage) {
-      await this.prisma.quizSession.update({
-        where: { id: session.id },
-        data: { state: 'completed', endedAt: new Date() },
-      });
-      return { done: true, message: 'Session completed' };
-    }
+    // 🔀 Randomize stage for this question (no sequential gating)
+    const stage = this.randomStage();
 
     await this.ensurePoolForStage(stage);
     const question = await this.pickRandomQuestion(session.id, stage);
@@ -194,10 +185,14 @@ export class GameService {
       select: { id: true, attemptToken: true, startedAt: true },
     });
 
+    // TTL ~= avg question time + safety
+    const ttlSeconds =
+      Math.ceil((question?.avgTimeToAnswerMs ?? 30000) / 1000) + 5;
+
     await this.redis.setAttemptToken(
       attempt.attemptToken,
       { userId, attemptId: attempt.id },
-      30,
+      ttlSeconds,
     );
 
     const body: any = question.body as any;
@@ -211,7 +206,7 @@ export class GameService {
         category: question.category,
       },
       attemptToken: attempt.attemptToken,
-      ttlSeconds: 30,
+      ttlSeconds,
     };
   }
 
@@ -408,6 +403,40 @@ export class GameService {
     return { ok: true, state: 'completed' };
   }
 
+  // Anti-cheat: reset current session points to zero (compensating penalty)
+  async resetPointsToZero(userId: string) {
+    const session = await this.requireActiveSession(userId);
+    const state = await this.computeStageState(session.id);
+    const totalPoints =
+      (state.byStage[STAGES.BASIC]?.points ?? 0) +
+      (state.byStage[STAGES.MID]?.points ?? 0) +
+      (state.byStage[STAGES.ADV]?.points ?? 0);
+
+    if (totalPoints <= 0) return { ok: true, reset: false, stageState: state };
+
+    // attribute penalty to any available question (keep FK intact)
+    const anyQ = await this.prisma.question.findFirst({ select: { id: true } });
+    if (!anyQ) return { ok: true, reset: false, stageState: state };
+
+    await this.prisma.attempt.create({
+      data: {
+        sessionId: session.id,
+        questionId: anyQ.id,
+        attemptToken: `reset:${crypto.randomUUID()}`,
+        answeredAt: new Date(),
+        timeTakenMs: 0,
+        selectedIndex: -1,
+        correct: false,
+        pointsDelta: -Math.abs(totalPoints),
+        clientMeta: { antiCheatReset: true },
+      },
+    });
+
+    await this.bumpLeaderboards(userId, -Math.abs(totalPoints));
+    const stageState = await this.computeStageState(session.id);
+    return { ok: true, reset: true, stageState };
+  }
+
   // ----------------- helpers -----------------
 
   private async requireActiveSession(userId: string) {
@@ -466,37 +495,84 @@ export class GameService {
     return null;
   }
 
+  // private async computeStageState(sessionId: string) {
+  //   const attempts = await this.prisma.attempt.findMany({
+  //     where: { sessionId },
+  //   });
+  //   const byStage: Record<
+  //     Stage,
+  //     { answered: number; correct: number; points: number }
+  //   > = {
+  //     [STAGES.BASIC]: { answered: 0, correct: 0, points: 0 },
+  //     [STAGES.MID]: { answered: 0, correct: 0, points: 0 },
+  //     [STAGES.ADV]: { answered: 0, correct: 0, points: 0 },
+  //   };
+  //   for (const a of attempts) {
+  //     if (!a.questionId || a.questionId === 'penalty') {
+  //       const p = a.pointsDelta ?? 0;
+  //       byStage[STAGES.BASIC].points += p;
+  //       continue;
+  //     }
+  //     const q = await this.prisma.question.findUnique({
+  //       where: { id: a.questionId },
+  //     });
+  //     if (!q) continue;
+  //     const s = this.stageFromCategory(q.category);
+  //     if (a.answeredAt) {
+  //       byStage[s].answered += 1;
+  //       if (a.correct) byStage[s].correct += 1;
+  //       byStage[s].points += a.pointsDelta ?? 0;
+  //     }
+  //   }
+  //   return { byStage };
+  // }
+
   private async computeStageState(sessionId: string) {
-    const attempts = await this.prisma.attempt.findMany({
-      where: { sessionId },
-    });
-    const byStage: Record<
-      Stage,
-      { answered: number; correct: number; points: number }
-    > = {
-      [STAGES.BASIC]: { answered: 0, correct: 0, points: 0 },
-      [STAGES.MID]: { answered: 0, correct: 0, points: 0 },
-      [STAGES.ADV]: { answered: 0, correct: 0, points: 0 },
-    };
-    for (const a of attempts) {
-      if (!a.questionId || a.questionId === 'penalty') {
-        const p = a.pointsDelta ?? 0;
-        byStage[STAGES.BASIC].points += p;
-        continue;
-      }
-      const q = await this.prisma.question.findUnique({
-        where: { id: a.questionId },
-      });
-      if (!q) continue;
-      const s = this.stageFromCategory(q.category);
-      if (a.answeredAt) {
-        byStage[s].answered += 1;
-        if (a.correct) byStage[s].correct += 1;
-        byStage[s].points += a.pointsDelta ?? 0;
-      }
+  // Pull all attempts for the session
+  const attempts = await this.prisma.attempt.findMany({
+    where: { sessionId },
+    select: { questionId: true, answeredAt: true, correct: true, pointsDelta: true },
+  });
+
+  // Collect unique questionIds we actually need
+  const qids = Array.from(
+    new Set(
+      attempts
+        .filter(a => a.questionId && a.questionId !== 'penalty')
+        .map(a => a.questionId as string)
+    )
+  );
+
+  // Batch-load those questions once
+  const questions = await this.prisma.question.findMany({
+    where: { id: { in: qids } },
+    select: { id: true, category: true },
+  });
+  const qMap = new Map(questions.map(q => [q.id, q.category]));
+
+  const byStage: Record<Stage, { answered: number; correct: number; points: number }> = {
+    [STAGES.BASIC]: { answered: 0, correct: 0, points: 0 },
+    [STAGES.MID]:   { answered: 0, correct: 0, points: 0 },
+    [STAGES.ADV]:   { answered: 0, correct: 0, points: 0 },
+  };
+
+  for (const a of attempts) {
+    if (!a.questionId || a.questionId === 'penalty') {
+      byStage[STAGES.BASIC].points += a.pointsDelta ?? 0;
+      continue;
     }
-    return { byStage };
+    const cat = qMap.get(a.questionId as string);
+    if (!cat) continue;
+    const s = this.stageFromCategory(cat);
+    if (a.answeredAt) {
+      byStage[s].answered += 1;
+      if (a.correct) byStage[s].correct += 1;
+      byStage[s].points  += a.pointsDelta ?? 0;
+    }
   }
+
+  return { byStage };
+}
 
   private async ensurePoolForStage(stage: Stage) {
     const cat = STAGE_CATEGORY[stage];
@@ -545,50 +621,53 @@ export class GameService {
   private async pickRandomQuestion(sessionId: string, stage: Stage) {
     const cat = STAGE_CATEGORY[stage];
 
+    // already asked in this session
     const asked = await this.prisma.attempt.findMany({
       where: { sessionId, questionId: { not: 'penalty' } },
       select: { questionId: true },
     });
-    const askedIds = new Set(asked.map((a) => a.questionId));
+    const askedIds = asked.map((a) => a.questionId);
 
-    const pool = await this.prisma.question.findMany({
-      where: {
-        // active: true,
-        category: { equals: cat, mode: 'insensitive' },
-      },
-      select: {
-        id: true,
-        body: true,
-        avgTimeToAnswerMs: true,
-        category: true,
-      },
-      take: 50,
-    });
-    this.logger.debug(
-      `pickRandomQuestion: cat=${cat}, pool=${pool.length}, asked=${askedIds.size}`,
-    );
+    // category-matched pool excluding asked; pick by random skip
+    const where = {
+      category: { equals: cat, mode: 'insensitive' },
+      id: { notIn: askedIds },
+    } as const;
 
-    let candidates = pool.filter((q) => !askedIds.has(q.id));
-
-    if (!candidates.length) {
-      const poolAll = await this.prisma.question.findMany({
-        where: { 
-          // active: true 
-        },
+    const total = await this.prisma.question.count({ where });
+    if (total > 0) {
+      const skip = Math.floor(Math.random() * total);
+      const [q] = await this.prisma.question.findMany({
+        where,
         select: {
           id: true,
           body: true,
           avgTimeToAnswerMs: true,
           category: true,
         },
-        take: 100,
+        skip,
+        take: 1,
       });
-      candidates = poolAll.filter((q) => !askedIds.has(q.id));
+      if (q) return q;
     }
 
-    if (!candidates.length) return null;
-    const idx = Math.floor(Math.random() * candidates.length);
-    return candidates[idx];
+    // fallback: any question not yet asked
+    const whereAny = { id: { notIn: askedIds } } as const;
+    const totalAny = await this.prisma.question.count({ where: whereAny });
+    if (totalAny === 0) return null;
+    const skipAny = Math.floor(Math.random() * totalAny);
+    const [anyQ] = await this.prisma.question.findMany({
+      where: whereAny,
+      select: {
+        id: true,
+        body: true,
+        avgTimeToAnswerMs: true,
+        category: true,
+      },
+      skip: skipAny,
+      take: 1,
+    });
+    return anyQ ?? null;
   }
 
   private async maybeUnlockNextStage(sessionId: string, stageUnlocked: Stage) {
@@ -609,5 +688,10 @@ export class GameService {
       });
       await this.ensurePoolForStage((stageUnlocked + 1) as Stage);
     }
+  }
+
+  private randomStage(): Stage {
+    const v = Math.floor(Math.random() * 3);
+    return v === 0 ? STAGES.BASIC : v === 1 ? STAGES.MID : STAGES.ADV;
   }
 }
