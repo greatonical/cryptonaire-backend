@@ -44,6 +44,8 @@ function allocWeighted(totalWei: bigint, entries: { userId: string; walletAddres
 
 @Injectable()
 export class PayoutsService {
+  private enabled = (process.env.BULLMQ_ENABLED ?? 'false').toLowerCase() === 'true';
+
   constructor(
     private readonly bull: BullmqService,
     private readonly prisma: PrismaService,
@@ -51,8 +53,22 @@ export class PayoutsService {
   ) {}
 
   async onModuleInit() {
-    // Worker
-    this.bull.payoutsWorker = new (await import('bullmq')).Worker(
+    if (!this.enabled) {
+      log.warn('BullMQ is DISABLED. Payouts will run inline when triggered.');
+      return;
+    }
+
+    // If BullmqService didn’t create a connection/queue, do not crash.
+    if (!this.bull.connection) {
+      log.error('BullMQ enabled but no connection found. Disabling queue workers.');
+      this.enabled = false;
+      return;
+    }
+
+    // Dynamically import only when enabled (keeps runtime light when disabled)
+    const { Worker } = await import('bullmq');
+
+    this.bull.payoutsWorker = new Worker(
       'payouts',
       async (job) => {
         if (job.name === 'weeklyClose') return this.processWeeklyClose();
@@ -63,23 +79,34 @@ export class PayoutsService {
       { connection: this.bull.connection, concurrency: 5 },
     );
 
-    // Repeatable weekly close (defaults to Monday 00:05 UTC)
+    // Schedule weekly close (Monday 00:05 UTC by default)
     const cron = process.env.REWARD_WEEKLY_CRON || '5 0 * * 1';
-    await this.bull.payoutsQueue.add(
+    await this.bull.payoutsQueue?.add(
       'weeklyClose',
       {},
       { repeat: { pattern: cron, tz: 'UTC' }, jobId: 'weeklyClose' },
     );
+
+    log.log('Payouts worker initialized (BullMQ enabled).');
   }
 
-  // Admin can still kick this manually via controller (enqueueDispatchWeek)
+  /**
+   * Public: enqueue dispatch OR run inline if BullMQ is disabled.
+   */
   async enqueueDispatchWeek(weekId: number, mode?: PayoutMode) {
-    await this.bull.payoutsQueue.add('dispatchWeek', { weekId, mode }, {
-      jobId: `dispatch:${weekId}`,
-      removeOnComplete: true,
-      removeOnFail: false,
-    });
-    return { ok: true, queued: true };
+    if (this.enabled && this.bull.payoutsQueue) {
+      await this.bull.payoutsQueue.add(
+        'dispatchWeek',
+        { weekId, mode },
+        { jobId: `dispatch:${weekId}`, removeOnComplete: true, removeOnFail: false },
+      );
+      return { ok: true, queued: true };
+    }
+
+    // Inline execution fallback when queues are disabled
+    log.warn('BullMQ disabled — dispatching payouts inline.');
+    await this.processDispatchWeek({ weekId, mode });
+    return { ok: true, queued: false };
   }
 
   // ============= Weekly automation =============
@@ -141,8 +168,17 @@ export class PayoutsService {
       }
     });
 
-    // Enqueue dispatch for that week (uses PAYOUT_MODE by default)
-    await this.enqueueDispatchWeek(weekId);
+    // Dispatch step: queue if enabled, inline otherwise
+    if (this.enabled && this.bull.payoutsQueue) {
+      await this.bull.payoutsQueue.add(
+        'dispatchWeek',
+        { weekId },
+        { jobId: `dispatch:${weekId}`, removeOnComplete: true, removeOnFail: false },
+      );
+    } else {
+      log.warn('BullMQ disabled — dispatching payouts inline after weekly close.');
+      await this.processDispatchWeek({ weekId });
+    }
 
     return { ok: true, weekId, winners: allocations.length, token, mode };
   }
@@ -158,12 +194,16 @@ export class PayoutsService {
     });
 
     for (const r of rows) {
-      await this.bull.payoutsQueue.add('sendAllocation', { weekId: data.weekId, allocationId: r.id, mode }, {
-        jobId: `alloc:${r.id}`,
-        removeOnComplete: true,
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 5000 },
-      });
+      if (this.enabled && this.bull.payoutsQueue) {
+        await this.bull.payoutsQueue.add(
+          'sendAllocation',
+          { weekId: data.weekId, allocationId: r.id, mode },
+          { jobId: `alloc:${r.id}`, removeOnComplete: true, attempts: 3, backoff: { type: 'exponential', delay: 5000 } },
+        );
+      } else {
+        // Inline sending fallback
+        await this.processSendAllocation({ weekId: data.weekId, allocationId: r.id, mode });
+      }
     }
     return { count: rows.length };
   }
