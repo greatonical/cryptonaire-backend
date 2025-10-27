@@ -1,147 +1,147 @@
 // src/modules/auth/farcaster.service.ts
-// Purpose: Farcaster Mini App auth helpers (verify -> upsert -> JWT)
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
-import { PrismaService } from '@infra/prisma.service';
-import { JwtService } from '@nestjs/jwt';
+// Purpose: Verify Farcaster Quick Auth tokens, allow-list audiences, upsert user, issue app JWT
 
-type QuickAuthProfile = {
-  fid: number;
-  custodyAddress: string;
-  username?: string | null;
-  pfpUrl?: string | null;
-};
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { PrismaService } from '@infra/prisma.service';
+import { createClient, Errors } from '@farcaster/quick-auth';
+import * as jwt from 'jsonwebtoken';
 
 @Injectable()
 export class FarcasterService {
-  protected readonly log = new Logger(FarcasterService.name);
+  private readonly log = new Logger('FarcasterService');
+  private readonly quick = createClient();
 
-  constructor(
-    private readonly prisma: PrismaService,
-    private readonly jwt: JwtService,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
 
-  /**
-   * Verify a Quick Auth token (e.g., Neynar) and return normalized profile.
-   * Replace the stub with the official SDK call as needed.
-   */
-  async verifyQuickAuthToken(token: string): Promise<QuickAuthProfile> {
+  /** Issue your normal app JWT (adapt to your JWT strategy if needed) */
+  private signAppJwt(userId: string) {
+    const secret = process.env.JWT_SECRET || 'dev-secret-change-me';
+    return jwt.sign({ sub: userId, uid: userId }, secret, { expiresIn: '30d' });
+  }
+
+  // -------- audience helpers --------
+
+  /** Base64url decode */
+  private b64urlDecode(s: string): string {
+    const pad = s.length % 4 === 2 ? '==' : s.length % 4 === 3 ? '=' : '';
+    return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64').toString('utf8');
+  }
+
+  /** Extract `aud` (host) from JWT payload without verifying */
+  private decodeAudHost(token: string): string | null {
     try {
-      // TODO: Replace with real verification via Neynar/Hubs:
-      // const client = new NeynarClient(process.env.NEYNAR_API_KEY!);
-      // const p = await client.verifyQuickAuthToken(token);
-      // return { fid: p.fid, custodyAddress: p.custody_address, username: p.username, pfpUrl: p.pfp_url };
-
-      // Stub: expect a JSON string for local dev
-      const p = JSON.parse(token);
-      if (!p?.fid || !p?.custodyAddress) throw new Error('Invalid token payload');
-      return {
-        fid: Number(p.fid),
-        custodyAddress: String(p.custodyAddress),
-        username: p.username ?? null,
-        pfpUrl: p.pfpUrl ?? null,
-      };
-    } catch (e: any) {
-      this.log.error(`QuickAuth token verify failed: ${e?.message ?? e}`);
-      throw new BadRequestException('Invalid Farcaster token');
+      const parts = token.split('.');
+      if (parts.length < 2) return null;
+      const payload = JSON.parse(this.b64urlDecode(parts[1]!));
+      const aud: unknown = payload?.aud;
+      if (!aud || typeof aud !== 'string') return null;
+      return this.normalizeHost(aud);
+    } catch {
+      return null;
     }
   }
 
+  private normalizeHost(h: string): string {
+    const raw = h.trim().toLowerCase();
+    // strip scheme if someone passed it
+    const noScheme = raw.replace(/^https?:\/\//, '');
+    // strip port
+    return noScheme.replace(/:\d+$/, '');
+  }
+
+  private getAllowedHosts(): string[] {
+    const raw = process.env.FARCASTER_ALLOWED_HOSTS || '';
+    return raw
+      .split(',')
+      .map((s) => this.normalizeHost(s))
+      .filter(Boolean);
+  }
+
+  private getAllowedSuffixes(): string[] {
+    const raw = process.env.FARCASTER_ALLOWED_SUFFIXES || '';
+    return raw
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  private isHostAllowed(audHost: string): boolean {
+    const hosts = this.getAllowedHosts();
+    const suffixes = this.getAllowedSuffixes();
+    if (hosts.length && hosts.includes(audHost)) return true;
+    if (suffixes.length && suffixes.some((suf) => audHost.endsWith(suf))) return true;
+    // If no allow-list configured, default deny in prod, allow in dev
+    if (!hosts.length && !suffixes.length) {
+      const dev = (process.env.NODE_ENV || 'development') !== 'production';
+      return dev;
+    }
+    return false;
+  }
+
+  // -------- public API --------
+
   /**
-   * Accepts either a string token or expanded object (with optional EVM signature).
-   * Best-effort signature verification (if provided), otherwise just normalizes.
+   * Verify the Quick Auth JWT and return a minimal profile { fid }.
+   * `requestHost` is optional; we rely primarily on the token's `aud` host.
    */
-  async verifyQuickAuth(
-    dtoOrToken:
-      | string
-      | {
-          fid: number;
-          custodyAddress?: string | null;
-          username?: string | null;
-          pfpUrl?: string | null;
-          message?: string;
-          signature?: `0x${string}`;
-          nonce?: string;
-        },
-  ): Promise<QuickAuthProfile> {
-    if (typeof dtoOrToken === 'string') {
-      return this.verifyQuickAuthToken(dtoOrToken);
-    }
-
-    const { fid, custodyAddress, username, pfpUrl, message, signature } = dtoOrToken;
-    if (!fid || !custodyAddress) {
-      throw new BadRequestException('Missing fid or custodyAddress');
-    }
-
-    // OPTIONAL: EVM signature check if provided (skipped if viem missing)
-    if (message && signature) {
-      try {
-        const { verifyMessage, isAddress } = await import('viem');
-        if (!isAddress(custodyAddress)) throw new Error('Invalid address');
-        const ok = await verifyMessage({
-          address: custodyAddress as `0x${string}`,
-          message,
-          signature,
-        });
-        if (!ok) throw new Error('Invalid signature');
-      } catch (e) {
-        this.log.warn(`Signature verify skipped/failed: ${(e as any)?.message ?? e}`);
+  async verifyQuickAuthToken(token: string, requestHost?: string) {
+    try {
+      const audHost = this.decodeAudHost(token);
+      if (!audHost) {
+        this.log.error('QuickAuth token verify failed: missing/invalid aud');
+        throw new UnauthorizedException('Invalid Farcaster token');
       }
+
+      if (!this.isHostAllowed(audHost)) {
+        this.log.error(`QuickAuth token verify failed: aud "${audHost}" not allowed`);
+        throw new UnauthorizedException('Invalid Farcaster audience');
+      }
+
+      // If FARCASTER_DOMAIN is set, pin to it (prod). Otherwise verify against audHost (preview/dev).
+      const verifyDomain =
+        (process.env.FARCASTER_DOMAIN && this.normalizeHost(process.env.FARCASTER_DOMAIN)) ||
+        audHost;
+
+      // This checks signature and standard claims (aud, exp, etc.)
+      const payload = await this.quick.verifyJwt({ token, domain: verifyDomain });
+
+      const fid = Number(payload.sub);
+      if (!Number.isFinite(fid)) throw new Error('Invalid FID in token');
+
+      return { fid };
+    } catch (e: any) {
+      if (e instanceof Errors.InvalidTokenError) {
+        this.log.error(`QuickAuth token verify failed: ${e.message}`);
+        throw new BadRequestException('Invalid Farcaster token');
+      }
+      if (e instanceof UnauthorizedException) throw e;
+      this.log.error('QuickAuth verify error', e);
+      throw new BadRequestException('Could not verify Farcaster token');
     }
-
-    return {
-      fid: Number(fid),
-      custodyAddress: String(custodyAddress),
-      username: username ?? null,
-      pfpUrl: pfpUrl ?? null,
-    };
   }
 
-  /**
-   * Upsert user linking farcasterUserId and wallet address; syncs Profile.
-   */
-  async upsertFromFarcaster(dto: QuickAuthProfile) {
-    const fidStr = String(dto.fid);
-    const addr = dto.custodyAddress.toLowerCase();
+  /** Verify → upsert user → issue app JWT */
+  async loginWithQuickAuthToken(token: string, requestHost?: string) {
+    const { fid } = await this.verifyQuickAuthToken(token, requestHost);
 
+    // Upsert by farcasterUserId (FID stored as string)
     const user = await this.prisma.user.upsert({
-      where: { farcasterUserId: fidStr },
-      update: { walletAddress: addr },
-      create: { walletAddress: addr, farcasterUserId: fidStr },
-      select: { id: true, walletAddress: true, jwtVersion: true, role: true },
+      where: { farcasterUserId: String(fid) },
+      update: {}, // optionally refresh profile fields if you fetch them from Neynar/etc.
+      create: { farcasterUserId: String(fid) },
+      select: { id: true, walletAddress: true, farcasterUserId: true },
     });
 
-    await this.prisma.profile.upsert({
-      where: { userId: user.id },
-      update: {
-        username: dto.username ?? undefined,
-        avatarUrl: dto.pfpUrl ?? undefined,
-      },
-      create: {
-        userId: user.id,
-        username: dto.username ?? null,
-        avatarUrl: dto.pfpUrl ?? null,
-      },
-    });
-
-    return user;
-  }
-
-  async issueJwt(userId: string): Promise<string> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, jwtVersion: true, role: true },
-    });
-    if (!user) throw new BadRequestException('User not found');
-
-    const payload = { sub: user.id, v: user.jwtVersion, role: user.role };
-    return this.jwt.signAsync(payload);
-    // Configure JwtModule in your AuthModule:
-    // JwtModule.register({ secret: process.env.JWT_SECRET, signOptions: { expiresIn: '7d' } })
-  }
-
-  async loginWithQuickAuth(profile: QuickAuthProfile) {
-    const user = await this.upsertFromFarcaster(profile);
-    const jwt = await this.issueJwt(user.id);
-    return { jwt, userId: user.id, walletAddress: user.walletAddress };
+    const jwtToken = this.signAppJwt(user.id);
+    return {
+      jwt: jwtToken,
+      userId: user.id,
+      walletAddress: user.walletAddress ?? undefined,
+    };
   }
 }

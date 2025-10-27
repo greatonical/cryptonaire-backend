@@ -16,7 +16,7 @@ export class AuthService {
     const user = await this.prisma.user.upsert({
       where: { walletAddress },
       update: { farcasterUserId: farcasterUserId ?? undefined },
-      create: { walletAddress, farcasterUserId: farcasterUserId ?? null }
+      create: { walletAddress: walletAddress ?? null, farcasterUserId: farcasterUserId ?? null }
     });
     if (!await this.prisma.profile.findUnique({ where: { userId: user.id } })) {
       await this.prisma.profile.create({ data: { userId: user.id } });

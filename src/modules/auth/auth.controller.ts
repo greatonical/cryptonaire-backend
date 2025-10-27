@@ -59,7 +59,9 @@ export class AuthController {
 
       // Expected envs (prod/dev)
       const expectedDomain = process.env.SIWE_DOMAIN || "localhost:3000";
-      const expectedUri = (process.env.SIWE_URI || "http://localhost:3000").replace(/\/$/, "");
+      const expectedUri = (
+        process.env.SIWE_URI || "http://localhost:3000"
+      ).replace(/\/$/, "");
       const expectedChain = Number(process.env.BASE_CHAIN_ID || 8453);
       const normalize = (s: string) => s.replace(/\/$/, "");
 
@@ -122,7 +124,9 @@ export class AuthController {
 
       if (!okEOA && !ok1271) {
         const is6492 = (signature as string).startsWith("0x64926492");
-        const reason = is6492 ? "EIP-6492 signature not accepted" : "Signature invalid";
+        const reason = is6492
+          ? "EIP-6492 signature not accepted"
+          : "Signature invalid";
         throw new UnauthorizedException(reason);
       }
 
@@ -136,7 +140,12 @@ export class AuthController {
         .pop();
 
       const user = await this.auth.upsertUserByWallet(address, farcasterUserId);
-      const token = await this.auth.issueJwt(user);
+      const token = await this.auth.issueJwt({
+        id: user.id,
+        walletAddress: (user.walletAddress ?? address) as `0x${string}`,
+        farcasterUserId: user.farcasterUserId ?? null,
+        jwtVersion: user.jwtVersion,
+      });
       return {
         token,
         user: {
