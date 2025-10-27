@@ -10,7 +10,6 @@ export class FarcasterController {
   constructor(private readonly svc: FarcasterService) {}
 
   private getRequestHost(req: Request): string | undefined {
-    // Prefer reverse-proxy forwarded host, then Host, then req.hostname
     const xf = (req.headers['x-forwarded-host'] as string) || '';
     const host = (req.headers['host'] as string) || '';
     const h = (xf || host || req.hostname || '').trim();
@@ -23,11 +22,7 @@ export class FarcasterController {
     const token = body?.token;
     if (!token) throw new BadRequestException('token is required');
 
-    const requestHost =
-      process.env.PUBLIC_HOSTNAME ||
-      this.getRequestHost(req);
-
-    // Service chooses final verify domain from token.aud (allowed-list) unless FARCASTER_DOMAIN is set.
+    const requestHost = process.env.PUBLIC_HOSTNAME || this.getRequestHost(req);
     return this.svc.verifyQuickAuthToken(token, requestHost);
   }
 
@@ -37,10 +32,7 @@ export class FarcasterController {
     const token = body?.token;
     if (!token) throw new BadRequestException('token is required');
 
-    const requestHost =
-      process.env.PUBLIC_HOSTNAME ||
-      this.getRequestHost(req);
-
+    const requestHost = process.env.PUBLIC_HOSTNAME || this.getRequestHost(req);
     return this.svc.loginWithQuickAuthToken(token, requestHost); // { jwt, userId, walletAddress? }
   }
 }

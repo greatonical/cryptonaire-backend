@@ -1,5 +1,6 @@
 // src/modules/auth/farcaster.service.ts
-// Purpose: Verify Farcaster Quick Auth tokens, allow-list audiences, upsert user, issue app JWT
+// Purpose: Verify Farcaster Quick Auth tokens with host allow-list, upsert user,
+// and issue app JWT via AuthService (keeps AuthService signature unchanged).
 
 import {
   BadRequestException,
@@ -9,20 +10,17 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '@infra/prisma.service';
 import { createClient, Errors } from '@farcaster/quick-auth';
-import * as jwt from 'jsonwebtoken';
+import { AuthService } from '@modules/auth/auth.service';
 
 @Injectable()
 export class FarcasterService {
   private readonly log = new Logger('FarcasterService');
   private readonly quick = createClient();
 
-  constructor(private readonly prisma: PrismaService) {}
-
-  /** Issue your normal app JWT (adapt to your JWT strategy if needed) */
-  private signAppJwt(userId: string) {
-    const secret = process.env.JWT_SECRET || 'dev-secret-change-me';
-    return jwt.sign({ sub: userId, uid: userId }, secret, { expiresIn: '30d' });
-  }
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auth: AuthService, // use standard JWT issuer
+  ) {}
 
   // -------- audience helpers --------
 
@@ -48,9 +46,7 @@ export class FarcasterService {
 
   private normalizeHost(h: string): string {
     const raw = h.trim().toLowerCase();
-    // strip scheme if someone passed it
     const noScheme = raw.replace(/^https?:\/\//, '');
-    // strip port
     return noScheme.replace(/:\d+$/, '');
   }
 
@@ -75,7 +71,7 @@ export class FarcasterService {
     const suffixes = this.getAllowedSuffixes();
     if (hosts.length && hosts.includes(audHost)) return true;
     if (suffixes.length && suffixes.some((suf) => audHost.endsWith(suf))) return true;
-    // If no allow-list configured, default deny in prod, allow in dev
+    // If no allow-list configured, default allow in dev, deny in prod
     if (!hosts.length && !suffixes.length) {
       const dev = (process.env.NODE_ENV || 'development') !== 'production';
       return dev;
@@ -86,10 +82,10 @@ export class FarcasterService {
   // -------- public API --------
 
   /**
-   * Verify the Quick Auth JWT and return a minimal profile { fid }.
-   * `requestHost` is optional; we rely primarily on the token's `aud` host.
+   * Verify the Quick Auth JWT and return { fid }.
+   * `requestHost` can be provided by the controller, but we primarily trust token.aud.
    */
-  async verifyQuickAuthToken(token: string, requestHost?: string) {
+  async verifyQuickAuthToken(token: string, _requestHost?: string) {
     try {
       const audHost = this.decodeAudHost(token);
       if (!audHost) {
@@ -102,12 +98,12 @@ export class FarcasterService {
         throw new UnauthorizedException('Invalid Farcaster audience');
       }
 
-      // If FARCASTER_DOMAIN is set, pin to it (prod). Otherwise verify against audHost (preview/dev).
+      // If FARCASTER_DOMAIN is set (prod), pin to it; otherwise verify against audHost (preview/dev).
       const verifyDomain =
         (process.env.FARCASTER_DOMAIN && this.normalizeHost(process.env.FARCASTER_DOMAIN)) ||
         audHost;
 
-      // This checks signature and standard claims (aud, exp, etc.)
+      // Signature + claims verification
       const payload = await this.quick.verifyJwt({ token, domain: verifyDomain });
 
       const fid = Number(payload.sub);
@@ -125,23 +121,29 @@ export class FarcasterService {
     }
   }
 
-  /** Verify → upsert user → issue app JWT */
+  /** Verify → upsert user → issue app JWT via AuthService */
   async loginWithQuickAuthToken(token: string, requestHost?: string) {
     const { fid } = await this.verifyQuickAuthToken(token, requestHost);
 
     // Upsert by farcasterUserId (FID stored as string)
     const user = await this.prisma.user.upsert({
       where: { farcasterUserId: String(fid) },
-      update: {}, // optionally refresh profile fields if you fetch them from Neynar/etc.
+      update: {},
       create: { farcasterUserId: String(fid) },
-      select: { id: true, walletAddress: true, farcasterUserId: true },
+      // Select the shape AuthService.issueJwt expects (plus jwtVersion)
+      select: { id: true, walletAddress: true, farcasterUserId: true, jwtVersion: true },
     });
 
-    const jwtToken = this.signAppJwt(user.id);
-    return {
-      jwt: jwtToken,
-      userId: user.id,
-      walletAddress: user.walletAddress ?? undefined,
-    };
+    // Build the payload exactly as AuthService.issueJwt currently requires
+    const jwt = await this.auth.issueJwt({
+      id: user.id,
+      jwtVersion: user.jwtVersion,
+      // If no wallet yet, provide a safe placeholder string to satisfy the type.
+      // If you prefer "", use that instead — whichever your JwtStrategy tolerates.
+      walletAddress: user.walletAddress ?? '0x0000000000000000000000000000000000000000',
+      farcasterUserId: user.farcasterUserId ?? null,
+    });
+
+    return { jwt, userId: user.id, walletAddress: user.walletAddress ?? undefined };
   }
 }
